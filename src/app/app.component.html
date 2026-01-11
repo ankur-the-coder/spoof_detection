@@ -1,0 +1,21 @@
+<div class="app-container">
+  @if (!isLoaded) {
+  <div class="loading-screen">
+    <div class="spinner"></div>
+    <p>Loading AI Models...</p>
+  </div>
+  }
+
+  <video #videoElement autoplay playsinline muted></video>
+  <canvas #overlayCanvas></canvas>
+
+  @if (showDebug) {
+  <div class="info-overlay">
+    <div class="info-item">FPS: {{ fps | number:'1.1-1' }}</div>
+    <div class="info-item">CPU: {{ cpuInfo }}</div>
+    <div class="info-item">GPU: {{ gpuInfo }}</div>
+    <div class="info-item">Provider: {{ provider }}</div>
+    <div class="toggle-tip">Press 't' to toggle debug</div>
+  </div>
+  }
+</div>
