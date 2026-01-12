@@ -25,6 +25,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     private lastTime = 0;
     private animationId: number | null = null;
     showDebug = true;
+    private antiSpoofRunning = false; // Throttle anti-spoof to prevent queue buildup
 
     @HostListener('document:keydown.t', ['$event'])
     toggleDebug(event: KeyboardEvent) {
@@ -165,23 +166,43 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
                     categories: [{ score: probability }]
                 };
 
-                const result = await this.antiSpoofService.predict(video, detection);
+                // Throttle anti-spoof: skip if already running (prevents queue buildup on slow devices)
+                if (!this.antiSpoofRunning) {
+                    this.antiSpoofRunning = true;
+                    this.antiSpoofService.predict(video, detection)
+                        .then(result => {
+                            // 2. Calculate MIRRORED coordinates for Drawing (because video is flipped via CSS)
+                            const mirroredX = video.videoWidth - squareX - side;
 
-                // 2. Calculate MIRRORED coordinates for Drawing (because video is flipped via CSS)
-                // mirroredX = width - x - width
-                const mirroredX = video.videoWidth - squareX - side;
+                            // 3. Scale down visual box (0.8x) as per user request
+                            const visualScale = 0.8;
+                            const visualSide = side * visualScale;
+                            const visualX = mirroredX + (side - visualSide) / 2;
+                            const visualY = squareY + (side - visualSide) / 2;
 
-                // 3. Scale down visual box (0.8x) as per user request, while keeping inference box same
-                const visualScale = 0.8;
-                const visualSide = side * visualScale;
-                const visualX = mirroredX + (side - visualSide) / 2;
-                const visualY = squareY + (side - visualSide) / 2;
-
-                this.drawResult(ctx, { x: visualX, y: visualY, width: visualSide, height: visualSide }, result);
+                            this.drawResult(ctx!, { x: visualX, y: visualY, width: visualSide, height: visualSide }, result);
+                        })
+                        .catch(err => console.error('Anti-spoofing error:', err))
+                        .finally(() => { this.antiSpoofRunning = false; });
+                }
             } catch (err) {
                 console.error('Anti-spoofing error:', err);
             }
         }
+    }
+
+    isModalOpen = false;
+    capturedPhotos: string[] = [];
+
+    openPhotoModal() {
+        console.log('Opening photo modal...');
+        this.capturedPhotos = this.antiSpoofService.getCapturedPhotos();
+        console.log('Captured photos count:', this.capturedPhotos.length);
+        this.isModalOpen = true;
+    }
+
+    closePhotoModal() {
+        this.isModalOpen = false;
     }
 
     private drawResult(ctx: CanvasRenderingContext2D, bbox: { x: number, y: number, width: number, height: number }, result: { score: number, isReal: boolean }) {
