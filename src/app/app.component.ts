@@ -81,13 +81,20 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
             const faceDetector = this.modelService.getFaceDetector();
 
             if (video.readyState >= 2 && faceDetector) {
-                const startTime = performance.now();
-
                 try {
-                    // BlazeFace estimateFaces returns pixel coordinates
-                    // Pass existing video element directly
-                    const predictions = await faceDetector.estimateFaces(video, false);
-                    await this.handleDetectionResults(predictions);
+                    const startTimeMs = performance.now();
+
+                    // MediaPipe detectForVideo
+                    const result = faceDetector.detectForVideo(video, startTimeMs);
+
+                    if (result.detections.length > 0) {
+                        await this.handleDetectionResults(result.detections);
+                    } else {
+                        // Clear canvas if no faces
+                        const canvas = this.overlayCanvas.nativeElement;
+                        const ctx = canvas.getContext('2d');
+                        if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    }
 
                     const endTime = performance.now();
                     const delta = endTime - this.lastTime;
@@ -106,18 +113,13 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this.animationId = requestAnimationFrame(loop);
     }
 
-
-
-    // ... (existing methods: constructor, ngOnInit, ngAfterViewInit, ngOnDestroy, detectHardware, startDetectionLoop)
-
-    private async handleDetectionResults(predictions: any[]) {
+    private async handleDetectionResults(detections: any[]) {
         const video = this.videoElement.nativeElement;
         const canvas = this.overlayCanvas.nativeElement;
         const ctx = canvas.getContext('2d');
 
         if (!ctx) return;
 
-        // Match canvas size to video
         if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
             canvas.width = video.videoWidth;
             canvas.height = video.videoHeight;
@@ -125,70 +127,69 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-        // If debug is disabled, don't draw anything (or just draw clean video? User said "toggle debug", implies overlay info)
-        // Usually toggle debug toggles the TEXT info. The bounding boxes are main functionality.
-        // But the screenshot says "Press 't' to toggle debug" effectively checking the overlay.
-        // I will hide the bounding boxes too if debug is off? Or just the overlay?
-        // Let's assume toggle debug toggles the ENTIRE overlay (boxes + stats) or just stats?
-        // "there is a text on screen which says 'press t to toggle debug' but nothing happen"
-        // I will make it toggle the overlay.
-
-        for (const pred of predictions) {
+        // Process all faces concurrently
+        // We map each detection to a promise that resolves to its result + config
+        const promises = detections.map(async (det) => {
             try {
-                // BlazeFace returns [x, y] arrays for topLeft and bottomRight
-                const start = pred.topLeft as [number, number];
-                const end = pred.bottomRight as [number, number];
-                const probability = (pred.probability as number[])[0];
+                // MediaPipe returns pixel coordinates in 'boundingBox'
+                const { originX, originY, width, height } = det.boundingBox;
 
-                // Raw detected dimensions
-                const rawWidth = end[0] - start[0];
-                const rawHeight = end[1] - start[1];
-                const rawX = start[0];
-                const rawY = start[1];
-
-                // Make it SQUARE
-                const side = Math.max(rawWidth, rawHeight);
-                const centerX = rawX + rawWidth / 2;
-                const centerY = rawY + rawHeight / 2;
+                // Make it SQUARE for Anti-Spoof Service (maintain original logic)
+                const centerX = originX + width / 2;
+                const centerY = originY + height / 2;
+                const side = Math.max(width, height);
 
                 const squareX = centerX - side / 2;
                 const squareY = centerY - side / 2;
 
-                // 1. Pass LOGICAL (unflipped) coordinates to AntiSpoofService
-                // Normalize for service
-                const detection = {
+                // Prepare normalized detection for Service
+                const detectionForService = {
                     boundingBox: {
                         originX: squareX / video.videoWidth,
                         originY: squareY / video.videoHeight,
                         width: side / video.videoWidth,
                         height: side / video.videoHeight
-                    },
-                    categories: [{ score: probability }]
+                    }
+                    // categories not strictly needed by service if we trust bbox, but service might access it?
+                    // Checking service: it only uses boundingBox.
                 };
 
-                // Throttle anti-spoof: skip if already running (prevents queue buildup on slow devices)
-                if (!this.antiSpoofRunning) {
-                    this.antiSpoofRunning = true;
-                    this.antiSpoofService.predict(video, detection)
-                        .then(result => {
-                            // 2. Calculate MIRRORED coordinates for Drawing (because video is flipped via CSS)
-                            const mirroredX = video.videoWidth - squareX - side;
+                // Run Anti-Spoof Prediction
+                const result = await this.antiSpoofService.predict(video, detectionForService);
 
-                            // 3. Scale down visual box (0.8x) as per user request
-                            const visualScale = 0.8;
-                            const visualSide = side * visualScale;
-                            const visualX = mirroredX + (side - visualSide) / 2;
-                            const visualY = squareY + (side - visualSide) / 2;
-
-                            this.drawResult(ctx!, { x: visualX, y: visualY, width: visualSide, height: visualSide }, result);
-                        })
-                        .catch(err => console.error('Anti-spoofing error:', err))
-                        .finally(() => { this.antiSpoofRunning = false; });
-                }
+                return {
+                    originalBox: { x: originX, y: originY, width, height },
+                    squareBox: { x: squareX, y: squareY, width: side, height: side },
+                    result
+                };
             } catch (err) {
-                console.error('Anti-spoofing error:', err);
+                console.error('Anti-spoofing error for face:', err);
+                return null;
             }
-        }
+        });
+
+        const results = await Promise.all(promises);
+
+        // Draw all results
+        results.forEach(item => {
+            if (item) {
+                // Calculate MIRRORED coordinates for Drawing (because video is flipped via CSS)
+                // Note: The bounding box 'x' from MediaPipe is relative to the video source (not flipped).
+                // CSS flip means we need to draw at (Width - x - w).
+
+                const { x, y, width, height } = item.squareBox;
+
+                const mirroredX = video.videoWidth - x - width;
+
+                // Scale down visual box (0.8x) as per user request
+                const visualScale = 0.8;
+                const visualSide = width * visualScale;
+                const visualX = mirroredX + (width - visualSide) / 2;
+                const visualY = y + (height - visualSide) / 2;
+
+                this.drawResult(ctx, { x: visualX, y: visualY, width: visualSide, height: visualSide }, item.result);
+            }
+        });
     }
 
     isModalOpen = false;

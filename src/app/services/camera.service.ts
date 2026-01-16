@@ -11,7 +11,7 @@ export class CameraService {
       this.stream = await navigator.mediaDevices.getUserMedia({
         video: {
           width: { ideal: 1280 },
-          height: { ideal: 720 },
+          height: { ideal: 960 },
           facingMode: 'user'
         },
         audio: false

@@ -1,22 +1,34 @@
 import { Injectable } from '@angular/core';
 import * as ort from 'onnxruntime-web';
-import * as tf from '@tensorflow/tfjs-core';
-import '@tensorflow/tfjs-backend-wasm';
-import '@tensorflow/tfjs-backend-cpu';
-import * as blazeface from '@tensorflow-models/blazeface';
+import { FaceDetector, FilesetResolver } from '@mediapipe/tasks-vision';
 
 @Injectable({
     providedIn: 'root'
 })
 export class ModelService {
     private spoofSession: ort.InferenceSession | null = null;
-    private faceDetector: blazeface.BlazeFaceModel | null = null;
+    private faceDetector: FaceDetector | null = null;
     private isModelsLoaded = false;
 
     async loadModels() {
         if (this.isModelsLoaded) return;
 
         try {
+            console.log('Initializing MediaPipe Face Detector...');
+            const vision = await FilesetResolver.forVisionTasks(
+                'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm'
+            );
+
+            this.faceDetector = await FaceDetector.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: '/models/blaze_face_short_range.tflite',
+                    delegate: 'GPU'
+                },
+                runningMode: 'VIDEO',
+                minDetectionConfidence: 0.5,
+                minSuppressionThreshold: 0.3
+            });
+
             console.log('Initializing ONNX Runtime...');
             ort.env.wasm.wasmPaths = '/onnx-assets/';
 
@@ -27,9 +39,6 @@ export class ModelService {
             }
             const modelBuffer = await modelResponse.arrayBuffer();
 
-            // Set up ONNX Runtime threads
-            // Note: SharedArrayBuffer (threads) requires Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy headers.
-            // If not present, this falls back to single thread regardless of setting.
             ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4;
             ort.env.wasm.simd = true;
             ort.env.logLevel = 'error';
@@ -42,14 +51,6 @@ export class ModelService {
                 intraOpNumThreads: navigator.hardwareConcurrency || 4
             });
 
-            console.log('Initializing TensorFlow.js (WASM backend)...');
-            // Force WASM backend for stability and CPU performance
-            // Needs: npm install @tensorflow/tfjs-backend-wasm
-            await tf.setBackend('wasm');
-            await tf.ready();
-
-            this.faceDetector = await blazeface.load();
-
             this.isModelsLoaded = true;
             console.log('Models loaded successfully');
         } catch (error) {
@@ -58,14 +59,11 @@ export class ModelService {
         }
     }
 
-
-
-
     getSpoofSession(): ort.InferenceSession | null {
         return this.spoofSession;
     }
 
-    getFaceDetector(): blazeface.BlazeFaceModel | null {
+    getFaceDetector(): FaceDetector | null {
         return this.faceDetector;
     }
 
