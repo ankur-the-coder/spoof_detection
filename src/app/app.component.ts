@@ -2,8 +2,17 @@ import { Component, ElementRef, OnInit, ViewChild, AfterViewInit, OnDestroy, Hos
 import { CommonModule } from '@angular/common';
 import { CameraService } from './services/camera.service';
 import { ModelService } from './services/model.service';
-import { AntiSpoofService } from './services/antispoof.service';
+import { AntiSpoofService, SpoofResult } from './services/antispoof.service';
 
+// Temporal smoothing: track predictions per face position
+interface TrackedFace {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    history: SpoofResult[];
+    lastSeen: number;
+}
 
 @Component({
     selector: 'app-root',
@@ -25,7 +34,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     private lastTime = 0;
     private animationId: number | null = null;
     showDebug = true;
-    private antiSpoofRunning = false; // Throttle anti-spoof to prevent queue buildup
+
+    // Temporal smoothing: track faces across frames
+    private trackedFaces: TrackedFace[] = [];
+    private readonly SMOOTHING_WINDOW = 5;   // Average over N frames
+    private readonly FACE_MATCH_THRESHOLD = 100; // pixels distance to match tracked face
+    private readonly MIN_FACE_SIZE = 40;      // Minimum face dimension in pixels
 
     @HostListener('document:keydown.t', ['$event'])
     toggleDebug(event: KeyboardEvent) {
@@ -84,16 +98,18 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
                 try {
                     const startTimeMs = performance.now();
 
-                    // MediaPipe detectForVideo
+                    // MediaPipe face detection
                     const result = faceDetector.detectForVideo(video, startTimeMs);
 
                     if (result.detections.length > 0) {
                         await this.handleDetectionResults(result.detections);
                     } else {
-                        // Clear canvas if no faces
+                        // Clear canvas if no faces detected
                         const canvas = this.overlayCanvas.nativeElement;
                         const ctx = canvas.getContext('2d');
                         if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+                        // Clear tracked faces when no faces are detected
+                        this.trackedFaces = [];
                     }
 
                     const endTime = performance.now();
@@ -127,97 +143,149 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-        // Process all faces concurrently
-        // We map each detection to a promise that resolves to its result + config
-        const promises = detections.map(async (det) => {
+        const now = performance.now();
+
+        // Process faces SEQUENTIALLY to avoid ONNX session race conditions
+        const currentFrameFaces: Array<{
+            box: { x: number; y: number; width: number; height: number };
+            result: SpoofResult;
+        }> = [];
+
+        for (const det of detections) {
             try {
-                // MediaPipe returns pixel coordinates in 'boundingBox'
                 const { originX, originY, width, height } = det.boundingBox;
 
-                // Make it SQUARE for Anti-Spoof Service (maintain original logic)
-                const centerX = originX + width / 2;
-                const centerY = originY + height / 2;
-                const side = Math.max(width, height);
+                // Filter out tiny faces (likely false positives)
+                if (width < this.MIN_FACE_SIZE || height < this.MIN_FACE_SIZE) {
+                    continue;
+                }
 
-                const squareX = centerX - side / 2;
-                const squareY = centerY - side / 2;
+                // Run anti-spoof prediction
+                const result = await this.antiSpoofService.predict(video, {
+                    x: originX,
+                    y: originY,
+                    width,
+                    height
+                });
 
-                // Prepare normalized detection for Service
-                const detectionForService = {
-                    boundingBox: {
-                        originX: squareX / video.videoWidth,
-                        originY: squareY / video.videoHeight,
-                        width: side / video.videoWidth,
-                        height: side / video.videoHeight
-                    }
-                    // categories not strictly needed by service if we trust bbox, but service might access it?
-                    // Checking service: it only uses boundingBox.
-                };
-
-                // Run Anti-Spoof Prediction
-                const result = await this.antiSpoofService.predict(video, detectionForService);
-
-                return {
-                    originalBox: { x: originX, y: originY, width, height },
-                    squareBox: { x: squareX, y: squareY, width: side, height: side },
+                currentFrameFaces.push({
+                    box: { x: originX, y: originY, width, height },
                     result
-                };
+                });
             } catch (err) {
                 console.error('Anti-spoofing error for face:', err);
-                return null;
             }
-        });
+        }
 
-        const results = await Promise.all(promises);
+        // Update tracked faces with temporal smoothing
+        const usedTracked = new Set<number>();
 
-        // Draw all results
-        results.forEach(item => {
-            if (item) {
-                // Calculate MIRRORED coordinates for Drawing (because video is flipped via CSS)
-                // Note: The bounding box 'x' from MediaPipe is relative to the video source (not flipped).
-                // CSS flip means we need to draw at (Width - x - w).
+        for (const face of currentFrameFaces) {
+            const centerX = face.box.x + face.box.width / 2;
+            const centerY = face.box.y + face.box.height / 2;
 
-                const { x, y, width, height } = item.squareBox;
-
-                const mirroredX = video.videoWidth - x - width;
-
-                // Scale down visual box (0.8x) as per user request
-                const visualScale = 0.8;
-                const visualSide = width * visualScale;
-                const visualX = mirroredX + (width - visualSide) / 2;
-                const visualY = y + (height - visualSide) / 2;
-
-                this.drawResult(ctx, { x: visualX, y: visualY, width: visualSide, height: visualSide }, item.result);
+            // Find matching tracked face
+            let bestMatch = -1;
+            let bestDist = Infinity;
+            for (let i = 0; i < this.trackedFaces.length; i++) {
+                if (usedTracked.has(i)) continue;
+                const tracked = this.trackedFaces[i];
+                const trackedCX = tracked.x + tracked.width / 2;
+                const trackedCY = tracked.y + tracked.height / 2;
+                const dist = Math.hypot(centerX - trackedCX, centerY - trackedCY);
+                if (dist < this.FACE_MATCH_THRESHOLD && dist < bestDist) {
+                    bestDist = dist;
+                    bestMatch = i;
+                }
             }
-        });
+
+            if (bestMatch >= 0) {
+                // Update existing tracked face
+                const tracked = this.trackedFaces[bestMatch];
+                tracked.x = face.box.x;
+                tracked.y = face.box.y;
+                tracked.width = face.box.width;
+                tracked.height = face.box.height;
+                tracked.history.push(face.result);
+                if (tracked.history.length > this.SMOOTHING_WINDOW) {
+                    tracked.history.shift();
+                }
+                tracked.lastSeen = now;
+                usedTracked.add(bestMatch);
+            } else {
+                // New face
+                this.trackedFaces.push({
+                    x: face.box.x,
+                    y: face.box.y,
+                    width: face.box.width,
+                    height: face.box.height,
+                    history: [face.result],
+                    lastSeen: now
+                });
+            }
+        }
+
+        // Remove stale tracked faces (not seen for 500ms)
+        this.trackedFaces = this.trackedFaces.filter(f => now - f.lastSeen < 500);
+
+        // Draw results with smoothed predictions
+        for (const tracked of this.trackedFaces) {
+            if (tracked.history.length === 0) continue;
+
+            // Compute smoothed result: majority vote + averaged confidence
+            const realCount = tracked.history.filter(h => h.isReal).length;
+            const totalCount = tracked.history.length;
+            const smoothedIsReal = realCount > totalCount / 2;
+
+            // Average scores for the smoothed class
+            const relevantScores = tracked.history
+                .filter(h => h.isReal === smoothedIsReal)
+                .map(h => h.score);
+            const avgScore = relevantScores.length > 0
+                ? relevantScores.reduce((a, b) => a + b, 0) / relevantScores.length
+                : tracked.history[tracked.history.length - 1].score;
+
+            const smoothedResult: SpoofResult = {
+                isReal: smoothedIsReal,
+                score: avgScore,
+                label: smoothedIsReal ? 'REAL' : 'SPOOF',
+                realLogit: tracked.history[tracked.history.length - 1].realLogit,
+                spoofLogit: tracked.history[tracked.history.length - 1].spoofLogit
+            };
+
+            // Mirror X coordinate (video is CSS-flipped with scaleX(-1))
+            const mirroredX = video.videoWidth - tracked.x - tracked.width;
+
+            this.drawResult(ctx, {
+                x: mirroredX,
+                y: tracked.y,
+                width: tracked.width,
+                height: tracked.height
+            }, smoothedResult);
+        }
     }
 
-    isModalOpen = false;
-    capturedPhotos: string[] = [];
-
-    openPhotoModal() {
-        console.log('Opening photo modal...');
-        this.capturedPhotos = this.antiSpoofService.getCapturedPhotos();
-        console.log('Captured photos count:', this.capturedPhotos.length);
-        this.isModalOpen = true;
-    }
-
-    closePhotoModal() {
-        this.isModalOpen = false;
-    }
-
-    private drawResult(ctx: CanvasRenderingContext2D, bbox: { x: number, y: number, width: number, height: number }, result: { score: number, isReal: boolean }) {
+    private drawResult(
+        ctx: CanvasRenderingContext2D,
+        bbox: { x: number; y: number; width: number; height: number },
+        result: SpoofResult
+    ) {
         if (!this.showDebug) return;
 
         const color = result.isReal ? '#00ff00' : '#ff0000';
-        const labelText = `${result.isReal ? 'REAL' : 'SPOOF'}: ${result.score.toFixed(2)}`;
+        const labelText = `${result.label}: ${(result.score * 100).toFixed(1)}%`;
 
         ctx.strokeStyle = color;
-        ctx.lineWidth = 4;
+        ctx.lineWidth = 3;
         ctx.strokeRect(bbox.x, bbox.y, bbox.width, bbox.height);
 
+        // Background for label text
+        ctx.font = 'bold 20px Courier New';
+        const textWidth = ctx.measureText(labelText).width;
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+        ctx.fillRect(bbox.x, bbox.y - 26, textWidth + 8, 24);
+
         ctx.fillStyle = color;
-        ctx.font = 'bold 28px Courier New';
-        ctx.fillText(labelText, bbox.x, bbox.y - 10);
+        ctx.fillText(labelText, bbox.x + 4, bbox.y - 8);
     }
 }

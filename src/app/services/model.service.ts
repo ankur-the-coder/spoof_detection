@@ -25,7 +25,7 @@ export class ModelService {
                     delegate: 'GPU'
                 },
                 runningMode: 'VIDEO',
-                minDetectionConfidence: 0.5,
+                minDetectionConfidence: 0.7,
                 minSuppressionThreshold: 0.3
             });
 
@@ -33,22 +33,22 @@ export class ModelService {
             ort.env.wasm.wasmPaths = '/onnx-assets/';
 
             console.log('Loading Anti-Spoofing Model...');
-            const modelResponse = await fetch('/onnx-assets/antispoof.onnx');
+            const modelResponse = await fetch('/onnx-assets/best_model_quantized.onnx');
             if (!modelResponse.ok) {
                 throw new Error(`Failed to fetch model: ${modelResponse.status} ${modelResponse.statusText}`);
             }
             const modelBuffer = await modelResponse.arrayBuffer();
 
-            ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4;
+            ort.env.wasm.numThreads = 1;
             ort.env.wasm.simd = true;
-            ort.env.logLevel = 'error';
+            ort.env.logLevel = 'warning';
 
             this.spoofSession = await ort.InferenceSession.create(modelBuffer, {
                 executionProviders: ['wasm', 'cpu'],
                 graphOptimizationLevel: 'all',
-                executionMode: 'parallel',
-                interOpNumThreads: navigator.hardwareConcurrency || 4,
-                intraOpNumThreads: navigator.hardwareConcurrency || 4
+                executionMode: 'sequential',
+                interOpNumThreads: 1,
+                intraOpNumThreads: 1
             });
 
             this.isModelsLoaded = true;

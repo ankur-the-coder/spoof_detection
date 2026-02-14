@@ -6,7 +6,7 @@
   </div>
   }
 
-  <video #videoElement autoplay playsinline muted></video>
+  <video #videoElement class="mirrored-video" autoplay playsinline muted></video>
   <canvas #overlayCanvas></canvas>
 
   @if (showDebug) {
@@ -16,21 +16,6 @@
     <div class="info-item">GPU: {{ gpuInfo }}</div>
     <div class="info-item">Provider: {{ provider }}</div>
     <div class="toggle-tip">Press 't' to toggle debug</div>
-    <button (click)="openPhotoModal()" class="debug-btn">Show Debug Photos</button>
-  </div>
-  }
-
-  @if (isModalOpen) {
-  <div class="modal-overlay" (click)="closePhotoModal()">
-    <div class="modal-content" (click)="$event.stopPropagation()">
-      <h3>Captured Photos ({{ capturedPhotos.length }})</h3>
-      <div class="photo-grid">
-        @for (photo of capturedPhotos; track $index) {
-        <img [src]="photo" alt="Debug Face">
-        }
-      </div>
-      <button class="close-btn" (click)="closePhotoModal()">Close</button>
-    </div>
   </div>
   }
 </div>
